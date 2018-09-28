@@ -136,6 +136,7 @@ void BarSettingsDestroy (BarSettings_t *settings) {
 		free (settings->msgFormat[i].prefix);
 		free (settings->msgFormat[i].postfix);
 	}
+    free (settings->rec);
 	memset (settings, 0, sizeof (*settings));
 }
 
@@ -417,6 +418,9 @@ void BarSettingsRead (BarSettings_t *settings) {
 						break;
 					}
 				}
+            } else if (streq ("rec", key)) {
+                free (settings->rec);
+                settings->rec = BarSettingsExpandTilde (val, userhome);
 			} else {
 				BarUiMsg (settings, MSG_INFO,
 						"Unrecognized key %s at %s:%zu\n", key, path, lineNum);

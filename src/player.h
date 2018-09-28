@@ -74,6 +74,9 @@ typedef struct {
 	int64_t lastTimestamp;
 	sig_atomic_t interrupted;
 
+	/* output */
+    AVFormatContext *ofmt_ctx;
+
 	ao_device *aoDev;
 
 	/* settings (must be set before starting the thread) */

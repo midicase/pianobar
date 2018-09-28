@@ -197,7 +197,7 @@ static CURLcode BarPianoHttpRequest (CURL * const http,
 	curl_easy_reset (http);
 	CURLcode httpret;
 	setAndCheck (CURLOPT_URL, url);
-	setAndCheck (CURLOPT_USERAGENT, PACKAGE "-" VERSION);
+	setAndCheck (CURLOPT_USERAGENT, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/44.0.2403.89 Safari/537.36");
 	setAndCheck (CURLOPT_POSTFIELDS, req->postData);
 	setAndCheck (CURLOPT_WRITEFUNCTION, httpFetchCb);
 	setAndCheck (CURLOPT_WRITEDATA, &buffer);

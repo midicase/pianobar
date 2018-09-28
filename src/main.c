@@ -272,7 +272,7 @@ static void BarMainStartPlayback (BarApp_t *app, pthread_t *playerThread) {
 		app->player.mode = PLAYER_WAITING;
 		/* start player */
 		pthread_create (playerThread, NULL, BarPlayerThread,
-				&app->player);
+				app);
 	}
 }
 

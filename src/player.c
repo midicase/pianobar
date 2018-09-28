@@ -41,6 +41,8 @@ THE SOFTWARE.
 #include <limits.h>
 #include <assert.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -121,6 +123,7 @@ void BarPlayerReset (player_t * const p) {
 	p->lastTimestamp = 0;
 	p->interrupted = 0;
 	p->aoDev = NULL;
+	p->ofmt_ctx = NULL;
 }
 
 /*	Update volume filter
@@ -208,6 +211,8 @@ static bool openStream (player_t * const player) {
 		softfail ("find_stream_info");
 	}
 
+    av_dump_format(player->fctx, 0, player->url, 0);
+
 	/* ignore all streams, undone for audio stream below */
 	for (size_t i = 0; i < player->fctx->nb_streams; i++) {
 		player->fctx->streams[i]->discard = AVDISCARD_ALL;
@@ -253,6 +258,91 @@ static bool openStream (player_t * const player) {
 
 	return true;
 }
+
+static char* replace_char(char* str, char find, char replace){
+    char *current_pos = strchr(str,find);
+    while (current_pos){
+        *current_pos = replace;
+        current_pos = strchr(current_pos,find);
+    }
+    return str;
+}
+
+static bool openOutStream (player_t * const player, PianoStation_t * const curStation, PianoSong_t * const curSong) {
+    assert (player != NULL);
+    /* no leak? */
+    assert (player->ofmt_ctx == NULL);
+    int ret = -1;
+    AVStream *out_stream;
+
+    if (player->settings->rec != NULL &&
+            strlen (player->settings->rec) > 0) {
+
+        char *song_path;
+        int length;
+
+        song_path = calloc(512, 1);
+        mkdir(player->settings->rec, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
+        length = snprintf(song_path, 512, "%s/%s", player->settings->rec, curStation->name);
+
+        replace_char(song_path + strlen(player->settings->rec) + 1, '/', '-');  /* convert the forward slash to dash */
+
+        mkdir(song_path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); /* create the station folder */
+
+        snprintf(song_path + length, 512, "/%s by %s on %s.m4a", curSong->title, curSong->artist, curSong->album);
+        replace_char(song_path + length + 1, '/', '-');
+
+        if (access(song_path, F_OK) == 0) {
+            free (song_path);
+            return true;  /* already recorded, no need to do again. */
+        }
+
+        avformat_alloc_output_context2(&player->ofmt_ctx, NULL, "mp4", song_path);
+        if (!player->ofmt_ctx) {
+            free (song_path);
+            softfail ("avformat_alloc_output_context2");
+        }
+
+        out_stream = avformat_new_stream(player->ofmt_ctx, NULL);
+        if (!out_stream) {
+            free (song_path);
+            softfail ("avformat_new_stream");
+        }
+
+        ret = avcodec_parameters_copy(out_stream->codecpar, player->st->codecpar);
+        if (ret < 0) {
+            free (song_path);
+            softfail ("avcodec_parameters_copy");
+        }
+        out_stream->codecpar->codec_tag = 0;
+
+        if (!(player->ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+            ret = avio_open(&player->ofmt_ctx->pb, song_path, AVIO_FLAG_WRITE);
+            if (ret < 0) {
+                free (song_path);
+                softfail ("avio_open");
+            }
+        }
+
+        av_dump_format(player->ofmt_ctx, 0, song_path, 1);
+
+        av_dict_set(&player->ofmt_ctx->metadata, "artist", curSong->artist, 0);
+        av_dict_set(&player->ofmt_ctx->metadata, "title", curSong->title, 0);
+        av_dict_set(&player->ofmt_ctx->metadata, "album", curSong->album, 0);
+
+        ret = avformat_write_header(player->ofmt_ctx, NULL);
+        if (ret < 0) {
+            free (song_path);
+            softfail ("avformat_write_header");
+        }
+        free (song_path);
+        return true;
+    }
+
+    return false;
+}
+
 
 /*	setup filter chain
  */
@@ -370,6 +460,7 @@ static int play (player_t * const player) {
 
 	AVPacket pkt;
 	AVCodecContext * const cctx = player->cctx;
+	AVFormatContext * const out_cctx = player->ofmt_ctx;
 	av_init_packet (&pkt);
 	pkt.data = NULL;
 	pkt.size = 0;
@@ -388,6 +479,8 @@ static int play (player_t * const player) {
 				/* enter drain mode */
 				drainMode = DRAIN;
 				avcodec_send_packet (cctx, NULL);
+				if (out_cctx != NULL)
+				    av_write_frame(out_cctx, NULL);
 			} else if (pkt.stream_index != player->streamIdx) {
 				/* unused packet */
 				av_packet_unref (&pkt);
@@ -404,6 +497,9 @@ static int play (player_t * const player) {
 			} else {
 				/* fill buffer */
 				avcodec_send_packet (cctx, &pkt);
+				/* write to file */
+				if (out_cctx != NULL)
+				    av_write_frame(out_cctx, &pkt);
 			}
 		}
 
@@ -468,6 +564,15 @@ static void finish (player_t * const player) {
 		avcodec_close (player->cctx);
 		player->cctx = NULL;
 	}
+
+
+	if (player->ofmt_ctx != NULL) {
+		av_write_trailer(player->ofmt_ctx);
+        if (!(player->ofmt_ctx->oformat->flags & AVFMT_NOFILE))
+        	avio_closep(&player->ofmt_ctx->pb);
+        avformat_free_context(player->ofmt_ctx);
+	}
+	
 	if (player->fctx != NULL) {
 		avformat_close_input (&player->fctx);
 	}
@@ -480,13 +585,18 @@ static void finish (player_t * const player) {
 void *BarPlayerThread (void *data) {
 	assert (data != NULL);
 
-	player_t * const player = data;
+	BarApp_t * const app = data;
+	player_t * const player = &app->player;
+	PianoSong_t * const curSong = app->playlist;
+	PianoStation_t * const curStation = app->curStation;
+
 	uintptr_t pret = PLAYER_RET_OK;
 
 	bool retry;
 	do {
 		retry = false;
 		if (openStream (player)) {
+		    openOutStream(player, curStation, curSong);
 			if (openFilter (player) && openDevice (player)) {
 				changeMode (player, PLAYER_PLAYING);
 				BarPlayerSetVolume (player);
