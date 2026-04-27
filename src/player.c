@@ -334,11 +334,48 @@ static bool openOutStream (player_t * const player, PianoStation_t * const curSt
         av_dict_set(&player->ofmt_ctx->metadata, "title", curSong->title, 0);
         av_dict_set(&player->ofmt_ctx->metadata, "album", curSong->album, 0);
 
+        av_dict_set(&out_stream->metadata, "artist", curSong->artist, 0);
+        av_dict_set(&out_stream->metadata, "title", curSong->title, 0);
+        av_dict_set(&out_stream->metadata, "album", curSong->album, 0);
+
+        /* Add cover art stream if available */
+        AVFormatContext *cover_ctx = NULL;
+        AVStream *cover_stream = NULL;
+        if (curSong->coverArt != NULL && strlen (curSong->coverArt) > 0) {
+            if (avformat_open_input (&cover_ctx, curSong->coverArt, NULL, NULL) >= 0 &&
+                    avformat_find_stream_info (cover_ctx, NULL) >= 0) {
+                int cidx = av_find_best_stream (cover_ctx, AVMEDIA_TYPE_VIDEO,
+                        -1, -1, NULL, 0);
+                if (cidx >= 0) {
+                    cover_stream = avformat_new_stream (player->ofmt_ctx, NULL);
+                    if (cover_stream != NULL) {
+                        avcodec_parameters_copy (cover_stream->codecpar,
+                                cover_ctx->streams[cidx]->codecpar);
+                        cover_stream->disposition = AV_DISPOSITION_ATTACHED_PIC;
+                    }
+                }
+            }
+        }
+
         ret = avformat_write_header(player->ofmt_ctx, NULL);
         if (ret < 0) {
+            if (cover_ctx != NULL) avformat_close_input (&cover_ctx);
             free (song_path);
             softfail ("avformat_write_header");
         }
+
+        /* Write cover art packet after header */
+        if (cover_ctx != NULL && cover_stream != NULL) {
+            AVPacket *cover_pkt = av_packet_alloc ();
+            if (av_read_frame (cover_ctx, cover_pkt) >= 0) {
+                cover_pkt->stream_index = cover_stream->index;
+                cover_pkt->flags |= AV_PKT_FLAG_KEY;
+                av_write_frame (player->ofmt_ctx, cover_pkt);
+            }
+            av_packet_free (&cover_pkt);
+            avformat_close_input (&cover_ctx);
+        }
+
         free (song_path);
         return true;
     }
@@ -539,6 +576,10 @@ static int play (player_t * const player) {
 			} else {
 				/* fill buffer */
 				avcodec_send_packet (cctx, pkt);
+				/* write to recording file */
+				if (out_cctx != NULL) {
+					av_write_frame (out_cctx, pkt);
+				}
 			}
 		}
 
@@ -590,6 +631,19 @@ static int play (player_t * const player) {
 		av_packet_unref (pkt);
 	}
 	av_frame_free (&frame);
+
+	/* If we exited the loop before reaching EOF (e.g. user skip), the stream
+	 * still has unread packets that were never written to the recording file.
+	 * Read and record them now without decoding or playing. */
+	if (out_cctx != NULL && drainMode == FILL) {
+		while (av_read_frame (player->fctx, pkt) >= 0) {
+			if (pkt->stream_index == player->streamIdx) {
+				av_write_frame (out_cctx, pkt);
+			}
+			av_packet_unref (pkt);
+		}
+	}
+
 	av_packet_free (&pkt);
 	debugPrint (DEBUG_AUDIO, "decoder is done, waiting for ao player\n");
 	pthread_join (aoplaythread, NULL);
@@ -607,6 +661,14 @@ static void finish (player_t * const player) {
 	if (player->cctx != NULL) {
 		avcodec_free_context (&player->cctx);
 		player->cctx = NULL;
+	}
+	if (player->ofmt_ctx != NULL) {
+		av_write_trailer (player->ofmt_ctx);
+		if (!(player->ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+			avio_closep (&player->ofmt_ctx->pb);
+		}
+		avformat_free_context (player->ofmt_ctx);
+		player->ofmt_ctx = NULL;
 	}
 	if (player->fctx != NULL) {
 		avformat_close_input (&player->fctx);
