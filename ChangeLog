@@ -1,3 +1,36 @@
+Release 2024.12.21
+
+- Improved network error retrying
+- Improved compatibility with newer versions of ffmpeg and libcurl
+- Minor documentation fixes
+
+Release 2022.04.01
+
+- Not a joke
+- Fix compilation with ffmpeg 5.0 and replace deprecated function
+- Improved retry handling with unreliable HTTP proxies
+- Minor UI improvements
+
+Release 2020.11.28
+
+- Support changing station modes
+- Allow choosing time format
+- Add optional debug output
+
+Release 2020.04.05
+
+- Support writing audio to named pipe (audio_pipe)
+- Add resampling (sample_rate)
+- Fix station list not showing more than 95 stations
+
+Release 2019.02.14
+
+- Fix MP3 playback (affects premium subscribers with audio quality “high”)
+
+Release 2019.01.25
+
+- Implement audio buffering
+
 Release 2018.06.22
 
 - Happy 10th birthday pianobar!

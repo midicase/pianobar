@@ -117,6 +117,9 @@ PianoReturn_t PianoRequest (PianoHandle_t *ph, PianoRequest_t *req,
 			/* get stations, user must be authenticated */
 			assert (ph->user.listenerId != NULL);
 
+			json_object_object_add (j, "returnAllStations",
+					json_object_new_boolean (true));
+
 			method = "user.getStationList";
 			break;
 		}
@@ -363,6 +366,36 @@ PianoReturn_t PianoRequest (PianoHandle_t *ph, PianoRequest_t *req,
 					json_object_new_boolean (true));
 
 			method = "station.getStation";
+			break;
+		}
+
+		case PIANO_REQUEST_GET_STATION_MODES: {
+			PianoRequestDataGetStationModes_t *reqData = req->data;
+			assert (reqData != NULL);
+			PianoStation_t * const station = reqData->station;
+			assert (station != NULL);
+
+			json_object_object_add (j, "stationId",
+					json_object_new_string (station->id));
+
+			method = "interactiveradio.v1.getAvailableModesSimple";
+			req->secure = true;
+			break;
+		}
+
+		case PIANO_REQUEST_SET_STATION_MODE: {
+			PianoRequestDataSetStationMode_t *reqData = req->data;
+			assert (reqData != NULL);
+			PianoStation_t * const station = reqData->station;
+			assert (station != NULL);
+
+			json_object_object_add (j, "stationId",
+					json_object_new_string (station->id));
+			json_object_object_add (j, "modeId",
+					json_object_new_int (reqData->id));
+
+			method = "interactiveradio.v1.setAndGetAvailableModes";
+			req->secure = true;
 			break;
 		}
 

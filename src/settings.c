@@ -124,7 +124,9 @@ void BarSettingsDestroy (BarSettings_t *settings) {
 	free (settings->npSongFormat);
 	free (settings->npStationFormat);
 	free (settings->listSongFormat);
+	free (settings->timeFormat);
 	free (settings->fifo);
+	free (settings->audioPipe);
 	free (settings->rpcHost);
 	free (settings->rpcTlsPort);
 	free (settings->partnerUser);
@@ -164,7 +166,9 @@ void BarSettingsRead (BarSettings_t *settings) {
 	settings->volume = 0;
 	settings->timeout = 30; /* seconds */
 	settings->gainMul = 1.0;
-	settings->maxRetry = 3;
+	/* should be > 4, otherwise expired audio urls (403) can stop playback */
+	settings->maxRetry = 5;
+	settings->bufferSecs = 5;
 	settings->sortOrder = BAR_SORT_NAME_AZ;
 	settings->loveIcon = strdup (" <3");
 	settings->banIcon = strdup (" </3");
@@ -173,6 +177,7 @@ void BarSettingsRead (BarSettings_t *settings) {
 	settings->npSongFormat = strdup ("\"%t\" by \"%a\" on \"%l\"%r%@%s");
 	settings->npStationFormat = strdup ("Station \"%n\" (%i)");
 	settings->listSongFormat = strdup ("%i) %a - %t%r");
+	settings->timeFormat = strdup ("%s%r/%t");
 	settings->rpcHost = strdup (PIANO_RPC_HOST);
 	settings->rpcTlsPort = strdup ("443");
 	settings->partnerUser = strdup ("android");
@@ -181,7 +186,9 @@ void BarSettingsRead (BarSettings_t *settings) {
 	settings->inkey = strdup ("R=U!LH$O2B#");
 	settings->outkey = strdup ("6#26FRL$ZWD");
 	settings->fifo = BarGetXdgConfigDir (PACKAGE "/ctl");
+	settings->audioPipe = NULL;
 	assert (settings->fifo != NULL);
+	settings->sampleRate = 0; /* default to stream sample rate */
 
 	settings->msgFormat[MSG_NONE].prefix = NULL;
 	settings->msgFormat[MSG_NONE].postfix = NULL;
@@ -343,6 +350,8 @@ void BarSettingsRead (BarSettings_t *settings) {
 				settings->maxRetry = atoi (val);
 			} else if (streq ("timeout", key)) {
 				settings->timeout = atoi (val);
+			} else if (streq ("buffer_seconds", key)) {
+				settings->bufferSecs = atoi (val);
 			} else if (streq ("sort", key)) {
 				size_t i;
 				static const char *mapping[] = {"name_az",
@@ -383,11 +392,19 @@ void BarSettingsRead (BarSettings_t *settings) {
 			} else if (streq ("format_list_song", key)) {
 				free (settings->listSongFormat);
 				settings->listSongFormat = strdup (val);
+			} else if (streq ("format_time", key)) {
+				free (settings->timeFormat);
+				settings->timeFormat = strdup (val);
 			} else if (streq ("fifo", key)) {
 				free (settings->fifo);
 				settings->fifo = BarSettingsExpandTilde (val, userhome);
+			} else if (streq ("audio_pipe", key)) {
+				free (settings->audioPipe);
+				settings->audioPipe = BarSettingsExpandTilde (val, userhome);
 			} else if (streq ("autoselect", key)) {
 				settings->autoselect = atoi (val);
+			} else if (streq ("sample_rate", key)) {
+				settings->sampleRate = atoi (val);
 			} else if (strncmp (formatMsgPrefix, key,
 					strlen (formatMsgPrefix)) == 0) {
 				static const char *mapping[] = {"none", "info", "nowplaying",

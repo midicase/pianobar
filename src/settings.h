@@ -84,7 +84,7 @@ typedef struct {
 
 typedef struct {
 	bool autoselect;
-	unsigned int history, maxRetry, timeout;
+	unsigned int history, maxRetry, timeout, bufferSecs;
 	int volume;
 	float gainMul;
 	BarStationSorting_t sortOrder;
@@ -100,10 +100,12 @@ typedef struct {
 	char *atIcon;
 	char *npSongFormat;
 	char *npStationFormat;
-	char *listSongFormat;
+	char *listSongFormat, *timeFormat;
 	char *fifo;
 	char *rpcHost, *rpcTlsPort, *partnerUser, *partnerPassword, *device, *inkey, *outkey, *caBundle;
+	char *audioPipe;
 	char keys[BAR_KS_COUNT];
+	int sampleRate;
 	BarMsgFormatStr_t msgFormat[MSG_COUNT];
     char *rec;
 } BarSettings_t;

@@ -224,6 +224,15 @@ BarUiActCallback(BarUiActAddSharedStation) {
 	}
 }
 
+static void drainPlaylist (BarApp_t * const app) {
+	BarUiDoSkipSong (&app->player);
+	if (app->playlist != NULL) {
+		/* drain playlist */
+		PianoDestroyPlaylist (PianoListNextP (app->playlist));
+		app->playlist->head.next = NULL;
+	}
+}
+
 /*	delete current station
  */
 BarUiActCallback(BarUiActDeleteStation) {
@@ -238,13 +247,7 @@ BarUiActCallback(BarUiActDeleteStation) {
 		BarUiMsg (&app->settings, MSG_INFO, "Deleting station... ");
 		if (BarUiActDefaultPianoCall (PIANO_REQUEST_DELETE_STATION,
 				selStation) && selStation == app->curStation) {
-			BarUiDoSkipSong (&app->player);
-			if (app->playlist != NULL) {
-				/* drain playlist */
-				PianoDestroyPlaylist (PianoListNextP (app->playlist));
-				app->playlist->head.next = NULL;
-				selSong = NULL;
-			}
+			drainPlaylist (app);
 			app->nextStation = NULL;
 			/* XXX: usually we shoudn’t touch cur*, but DELETE_STATION destroys
 			 * station struct */
@@ -268,8 +271,12 @@ BarUiActCallback(BarUiActExplain) {
 
 	BarUiMsg (&app->settings, MSG_INFO, "Receiving explanation... ");
 	if (BarUiActDefaultPianoCall (PIANO_REQUEST_EXPLAIN, &reqData)) {
-		BarUiMsg (&app->settings, MSG_INFO, "%s\n", reqData.retExplain);
-		free (reqData.retExplain);
+		if (reqData.retExplain == NULL) {
+			BarUiMsg (&app->settings, MSG_ERR, "No explanation provided.\n");
+		} else {
+			BarUiMsg (&app->settings, MSG_INFO, "%s\n", reqData.retExplain);
+			free (reqData.retExplain);
+		}
 	}
 	BarUiActDefaultEventcmd ("songexplain");
 }
@@ -478,12 +485,7 @@ BarUiActCallback(BarUiActSelectStation) {
 			"Select station: ", NULL, app->settings.autoselect);
 	if (newStation != NULL) {
 		app->nextStation = newStation;
-		BarUiDoSkipSong (&app->player);
-		if (app->playlist != NULL) {
-			/* drain playlist */
-			PianoDestroyPlaylist (PianoListNextP (app->playlist));
-			app->playlist->head.next = NULL;
-		}
+		drainPlaylist (app);
 	}
 }
 
@@ -773,7 +775,7 @@ BarUiActCallback(BarUiActManageStation) {
 	CURLcode wRet;
 	PianoRequestDataGetStationInfo_t reqData;
 	char selectBuf[2], allowedActions[6], *allowedPos = allowedActions;
-	char question[64];
+	char question[128];
 
 	memset (&reqData, 0, sizeof (reqData));
 	reqData.station = selStation;
@@ -787,7 +789,12 @@ BarUiActCallback(BarUiActManageStation) {
 	}
 
 	/* enable submenus depending on data availability */
-	strcpy (question, "Delete ");
+	if (reqData.info.artistSeeds != NULL ||
+			reqData.info.songSeeds != NULL ||
+			reqData.info.stationSeeds != NULL ||
+			reqData.info.feedback != NULL) {
+		strcpy (question, "Delete ");
+	}
 	if (reqData.info.artistSeeds != NULL) {
 		strcat (question, "[a]rtist");
 		*allowedPos++ = 'a';
@@ -816,17 +823,23 @@ BarUiActCallback(BarUiActManageStation) {
 		strcat (question, "[f]eedback");
 		*allowedPos++ = 'f';
 	}
+	if (allowedPos != allowedActions) {
+		strcat (question, "? ");
+	}
+	/* station mode is not available for QuickMix. */
+	if (!selStation->isQuickMix) {
+		strcat (question, "Manage [m]ode? ");
+		*allowedPos++ = 'm';
+	}
+
 	*allowedPos = '\0';
-	strcat (question, "? ");
 
-	assert (strlen (question) < sizeof (question) / sizeof (*question));
-
-	/* nothing to see? */
 	if (allowedPos == allowedActions) {
-		BarUiMsg (&app->settings, MSG_ERR, "No seeds or feedback available yet.\n");
-		PianoDestroyStationInfo (&reqData.info);
+		BarUiMsg (&app->settings, MSG_INFO, "No actions available.\n");
 		return;
 	}
+
+	assert (strlen (question) < sizeof (question) / sizeof (*question));
 
 	BarUiMsg (&app->settings, MSG_QUESTION, "%s", question);
 	if (BarReadline (selectBuf, sizeof (selectBuf), allowedActions, &app->input,
@@ -879,6 +892,47 @@ BarUiActCallback(BarUiActManageStation) {
 				BarUiActDefaultPianoCall (PIANO_REQUEST_DELETE_FEEDBACK, song);
 				BarUiActDefaultEventcmd ("stationdeletefeedback");
 			}
+		} else if (selectBuf[0] == 'm') {
+			PianoRequestDataGetStationModes_t subReqData =
+					{ .station = selStation };
+			BarUiMsg (&app->settings, MSG_INFO, "Fetching modes... ");
+			BarUiActDefaultPianoCall (PIANO_REQUEST_GET_STATION_MODES,
+					&subReqData);
+			BarUiActDefaultEventcmd ("stationgetmodes");
+
+			const PianoStationMode_t *curMode = subReqData.retModes;
+			unsigned int i = 0;
+			PianoListForeachP (curMode) {
+				BarUiMsg (&app->settings, MSG_LIST, "%2i) %s: %s%s\n", i,
+						curMode->name, curMode->description,
+						curMode->active ? " (active)" : "");
+				i++;
+			}
+
+			BarUiMsg (&app->settings, MSG_QUESTION, "Pick a new mode: ");
+			int selected;
+			while (true) {
+				if (BarReadlineInt (&selected, &app->input) == 0) {
+					break;
+				}
+
+				const PianoStationMode_t * const selMode =
+						PianoListGetP (subReqData.retModes, selected);
+				if (selMode != NULL) {
+					PianoRequestDataSetStationMode_t subReqDataSet =
+							{.station = selStation, .id = selected};
+					BarUiMsg (&app->settings, MSG_INFO,
+							"Selecting mode \"%s\"... ", selMode->name);
+					if (BarUiActDefaultPianoCall (
+							PIANO_REQUEST_SET_STATION_MODE, &subReqDataSet)) {
+						drainPlaylist (app);
+					}
+					BarUiActDefaultEventcmd ("stationsetmode");
+					break;
+				}
+			}
+
+			PianoDestroyStationMode (subReqData.retModes);
 		}
 	}
 

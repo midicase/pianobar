@@ -38,8 +38,10 @@ THE SOFTWARE.
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -58,6 +60,7 @@ THE SOFTWARE.
 #include <libavutil/frame.h>
 
 #include "player.h"
+#include "debug.h"
 #include "ui.h"
 #include "ui_types.h"
 
@@ -236,7 +239,7 @@ static bool openStream (player_t * const player) {
 		softfail ("avcodec_parameters_to_context");
 	}
 
-	AVCodec * const decoder = avcodec_find_decoder (cp->codec_id);
+	const AVCodec * const decoder = avcodec_find_decoder (cp->codec_id);
 	if (decoder == NULL) {
 		softfail ("find_decoder");
 	}
@@ -344,6 +347,15 @@ static bool openOutStream (player_t * const player, PianoStation_t * const curSt
 }
 
 
+/*	Get output sample rate. Default to stream sample rate
+ */
+static int getSampleRate (const player_t * const player) {
+	AVCodecParameters const * const cp = player->st->codecpar;
+	return player->settings->sampleRate == 0 ?
+			cp->sample_rate :
+			player->settings->sampleRate;
+}
+
 /*	setup filter chain
  */
 static bool openFilter (player_t * const player) {
@@ -359,37 +371,39 @@ static bool openFilter (player_t * const player) {
 	/* abuffer */
 	AVRational time_base = player->st->time_base;
 
+	char channelLayout[128];
+	av_channel_layout_describe(&player->cctx->ch_layout, channelLayout, sizeof(channelLayout));
 	snprintf (strbuf, sizeof (strbuf),
-			"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%"PRIx64, 
+			"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
 			time_base.num, time_base.den, cp->sample_rate,
 			av_get_sample_fmt_name (player->cctx->sample_fmt),
-			cp->channel_layout);
+			channelLayout);
 	if ((ret = avfilter_graph_create_filter (&player->fabuf,
-			avfilter_get_by_name ("abuffer"), NULL, strbuf, NULL,
+			avfilter_get_by_name ("abuffer"), "source", strbuf, NULL,
 			player->fgraph)) < 0) {
 		softfail ("create_filter abuffer");
 	}
 
 	/* volume */
 	if ((ret = avfilter_graph_create_filter (&player->fvolume,
-			avfilter_get_by_name ("volume"), NULL, "0dB", NULL,
+			avfilter_get_by_name ("volume"), "volume", "0dB", NULL,
 			player->fgraph)) < 0) {
 		softfail ("create_filter volume");
 	}
 
 	/* aformat: convert float samples into something more usable */
 	AVFilterContext *fafmt = NULL;
-	snprintf (strbuf, sizeof (strbuf), "sample_fmts=%s",
-			av_get_sample_fmt_name (avformat));
+	snprintf (strbuf, sizeof (strbuf), "sample_fmts=%s:sample_rates=%d",
+			av_get_sample_fmt_name (avformat), getSampleRate (player));
 	if ((ret = avfilter_graph_create_filter (&fafmt,
-					avfilter_get_by_name ("aformat"), NULL, strbuf, NULL,
+					avfilter_get_by_name ("aformat"), "format", strbuf, NULL,
 					player->fgraph)) < 0) {
 		softfail ("create_filter aformat");
 	}
 
 	/* abuffersink */
 	if ((ret = avfilter_graph_create_filter (&player->fbufsink,
-			avfilter_get_by_name ("abuffersink"), NULL, NULL, NULL,
+			avfilter_get_by_name ("abuffersink"), "sink", NULL, NULL,
 			player->fgraph)) < 0) {
 		softfail ("create_filter abuffersink");
 	}
@@ -417,14 +431,34 @@ static bool openDevice (player_t * const player) {
 	memset (&aoFmt, 0, sizeof (aoFmt));
 	aoFmt.bits = av_get_bytes_per_sample (avformat) * 8;
 	assert (aoFmt.bits > 0);
-	aoFmt.channels = cp->channels;
-	aoFmt.rate = cp->sample_rate;
+	aoFmt.channels = cp->ch_layout.nb_channels;
+	aoFmt.rate = getSampleRate (player);
 	aoFmt.byte_format = AO_FMT_NATIVE;
 
-	int driver = ao_default_driver_id ();
-	if ((player->aoDev = ao_open_live (driver, &aoFmt, NULL)) == NULL) {
-		BarUiMsg (player->settings, MSG_ERR, "Cannot open audio device.\n");
-		return false;
+	int driver = -1;
+	if (player->settings->audioPipe) {
+		// using audio pipe
+		struct stat st;
+		if (stat (player->settings->audioPipe, &st)) {
+			BarUiMsg (player->settings, MSG_ERR, "Cannot stat audio pipe file.\n");
+			return false;
+		}
+		if (!S_ISFIFO (st.st_mode)) {
+			BarUiMsg (player->settings, MSG_ERR, "File is not a pipe, error.\n");
+			return false;
+		}
+		driver = ao_driver_id ("raw");
+		if ((player->aoDev = ao_open_file(driver, player->settings->audioPipe, 1, &aoFmt, NULL)) == NULL) {
+			BarUiMsg (player->settings, MSG_ERR, "Cannot open audio pipe file.\n");
+			return false;
+		}
+	} else {
+		// use driver from libao configuration
+		driver = ao_default_driver_id ();
+		if ((player->aoDev = ao_open_live (driver, &aoFmt, NULL)) == NULL) {
+			BarUiMsg (player->settings, MSG_ERR, "Cannot open audio device.\n");
+			return false;
+		}
 	}
 
 	return true;
@@ -457,13 +491,14 @@ BarPlayerMode BarPlayerGetMode (player_t * const player) {
  */
 static int play (player_t * const player) {
 	assert (player != NULL);
-
-	AVPacket pkt;
+	const int64_t minBufferHealth = player->settings->bufferSecs;
 	AVCodecContext * const cctx = player->cctx;
 	AVFormatContext * const out_cctx = player->ofmt_ctx;
-	av_init_packet (&pkt);
-	pkt.data = NULL;
-	pkt.size = 0;
+
+	AVPacket *pkt = av_packet_alloc ();
+	assert (pkt != NULL);
+	pkt->data = NULL;
+	pkt->size = 0;
 
 	AVFrame *frame = NULL;
 	frame = av_frame_alloc ();
@@ -472,22 +507,29 @@ static int play (player_t * const player) {
 	pthread_create (&aoplaythread, NULL, BarAoPlayThread, player);
 	enum { FILL, DRAIN, DONE } drainMode = FILL;
 	int ret = 0;
+	const double timeBase = av_q2d (player->st->time_base);
 	while (!shouldQuit (player) && drainMode != DONE) {
 		if (drainMode == FILL) {
-			ret = av_read_frame (player->fctx, &pkt);
+			ret = av_read_frame (player->fctx, pkt);
 			if (ret == AVERROR_EOF) {
 				/* enter drain mode */
 				drainMode = DRAIN;
 				avcodec_send_packet (cctx, NULL);
 				if (out_cctx != NULL)
 				    av_write_frame(out_cctx, NULL);
-			} else if (pkt.stream_index != player->streamIdx) {
+			} else if (pkt->stream_index != player->streamIdx) {
 				/* unused packet */
-				av_packet_unref (&pkt);
+				av_packet_unref (pkt);
 				continue;
 			} else if (ret < 0) {
 				/* error, abort */
 				/* mark the EOF, so that BarAoPlayThread can quit*/
+				char error[AV_ERROR_MAX_STRING_SIZE];
+				if (av_strerror(ret, error, sizeof(error)) < 0) {
+					strncpy (error, "(unknown)", sizeof(error)-1);
+				}
+				debugPrint (DEBUG_AUDIO, "av_read_frame failed with code %i (%s), "
+						"sending NULL frame\n", ret, error);
 				pthread_mutex_lock (&player->aoplayLock);
 				const int rt = av_buffersrc_add_frame (player->fabuf, NULL);
 				assert (rt == 0);
@@ -496,10 +538,7 @@ static int play (player_t * const player) {
 				break;
 			} else {
 				/* fill buffer */
-				avcodec_send_packet (cctx, &pkt);
-				/* write to file */
-				if (out_cctx != NULL)
-				    av_write_frame(out_cctx, &pkt);
+				avcodec_send_packet (cctx, pkt);
 			}
 		}
 
@@ -509,6 +548,7 @@ static int play (player_t * const player) {
 				/* done draining */
 				drainMode = DONE;
 				/* mark the EOF*/
+				debugPrint (DEBUG_AUDIO, "receive_frame got EOF, sending NULL frame\n");
 				pthread_mutex_lock (&player->aoplayLock);
 				const int rt = av_buffersrc_add_frame (player->fabuf, NULL);
 				assert (rt == 0);
@@ -530,24 +570,28 @@ static int play (player_t * const player) {
 			pthread_mutex_unlock (&player->aoplayLock);
 			
 			int64_t bufferHealth = 0;
-			const int64_t minBufferHealth = 4; /* in seconds */
 			do {
 				pthread_mutex_lock (&player->aoplayLock);
-				bufferHealth = av_q2d (player->st->time_base) * 
-						(double) (frame->pts - player->lastTimestamp);
+				bufferHealth = timeBase * (double) (frame->pts - player->lastTimestamp);
 				if (bufferHealth > minBufferHealth) {
+					debugPrint (DEBUG_AUDIO, "decoding buffer filled health %"PRIi64" minHealth %"PRIi64"\n",
+							bufferHealth, minBufferHealth);
 					/* Buffer get healthy, resume */
 					pthread_cond_broadcast (&player->aoplayCond);
 					/* Buffer is healthy enough, wait */
 					pthread_cond_wait (&player->aoplayCond, &player->aoplayLock);
+					debugPrint (DEBUG_AUDIO, "ao play signalled it needs more data health %"PRIi64" minHealth %"PRIi64"\n",
+							bufferHealth, minBufferHealth);
 				}
 				pthread_mutex_unlock (&player->aoplayLock);
 			} while (bufferHealth > minBufferHealth);
 		}
 
-		av_packet_unref (&pkt);
+		av_packet_unref (pkt);
 	}
 	av_frame_free (&frame);
+	av_packet_free (&pkt);
+	debugPrint (DEBUG_AUDIO, "decoder is done, waiting for ao player\n");
 	pthread_join (aoplaythread, NULL);
 
 	return ret;
@@ -561,18 +605,9 @@ static void finish (player_t * const player) {
 		player->fgraph = NULL;
 	}
 	if (player->cctx != NULL) {
-		avcodec_close (player->cctx);
+		avcodec_free_context (&player->cctx);
 		player->cctx = NULL;
 	}
-
-
-	if (player->ofmt_ctx != NULL) {
-		av_write_trailer(player->ofmt_ctx);
-        if (!(player->ofmt_ctx->oformat->flags & AVFMT_NOFILE))
-        	avio_closep(&player->ofmt_ctx->pb);
-        avformat_free_context(player->ofmt_ctx);
-	}
-	
 	if (player->fctx != NULL) {
 		avformat_close_input (&player->fctx);
 	}
@@ -600,7 +635,9 @@ void *BarPlayerThread (void *data) {
 			if (openFilter (player) && openDevice (player)) {
 				changeMode (player, PLAYER_PLAYING);
 				BarPlayerSetVolume (player);
-				retry = play (player) == AVERROR_INVALIDDATA &&
+				const int ret = play (player);
+				retry = (ret == AVERROR_INVALIDDATA ||
+						 ret == -ECONNRESET) &&
 						!player->interrupted;
 			} else {
 				/* filter missing or audio device busy */
@@ -629,49 +666,60 @@ void *BarAoPlayThread (void *data) {
 	assert (filteredFrame != NULL);
 
 	int ret;
+	const double timeBase = av_q2d (av_buffersink_get_time_base (player->fbufsink)),
+			timeBaseSt = av_q2d (player->st->time_base);
 	while (!shouldQuit(player)) {
 		pthread_mutex_lock (&player->aoplayLock);
 		ret = av_buffersink_get_frame (player->fbufsink, filteredFrame);
 		if (ret == AVERROR_EOF || shouldQuit (player)) {
 			/* we are done here */
 			pthread_mutex_unlock (&player->aoplayLock);
+			debugPrint (DEBUG_AUDIO, "ao player got EOF, exiting\n");
 			break;
 		} else if (ret < 0) {
 			/* wait for more frames */
+			debugPrint (DEBUG_AUDIO, "ao player is waiting for more frames after code %i (%s)\n",
+					ret, av_err2str (ret));
+			pthread_cond_broadcast (&player->aoplayCond);
 			pthread_cond_wait (&player->aoplayCond, &player->aoplayLock);
 			pthread_mutex_unlock (&player->aoplayLock);
 			continue;
 		}
 		pthread_mutex_unlock (&player->aoplayLock);
 
-		const int numChannels = av_get_channel_layout_nb_channels (
-				filteredFrame->channel_layout);
+		const int numChannels = filteredFrame->ch_layout.nb_channels;
 		const int bps = av_get_bytes_per_sample (filteredFrame->format);
 		ao_play (player->aoDev, (char *) filteredFrame->data[0],
 				filteredFrame->nb_samples * numChannels * bps);
 
-		const unsigned int songPlayed = av_q2d (player->st->time_base) * 
-				(double) filteredFrame->pts;
+		const double timestamp = (double) filteredFrame->pts * timeBase;
+		const unsigned int songPlayed = timestamp;
+
 		pthread_mutex_lock (&player->lock);
 		player->songPlayed = songPlayed;
-
 		/* pausing */
 		if (player->doPause) {
 			do {
+				debugPrint (DEBUG_AUDIO, "ao player is paused\n");
 				pthread_cond_wait (&player->cond, &player->lock);
 			} while (player->doPause);
+			debugPrint (DEBUG_AUDIO, "ao player continues\n");
 		}
 		pthread_mutex_unlock (&player->lock);
 
+		/* lastTimestamp must be the last pts, but expressed in terms of
+		 * st->time_base, not the sink’s time_base. */
+		const int64_t lastTimestamp = timestamp/timeBaseSt;
 		/* notify download thread, we might need more data */
 		pthread_mutex_lock (&player->aoplayLock);
-		player->lastTimestamp = filteredFrame->pts;
+		player->lastTimestamp = lastTimestamp;
 		pthread_cond_broadcast (&player->aoplayCond);
 		pthread_mutex_unlock (&player->aoplayLock);
 
 		av_frame_unref (filteredFrame);
 	}
 	av_frame_free (&filteredFrame);
+	debugPrint (DEBUG_AUDIO, "ao player is done\n");
 
 	return (void *) 0;
 }
